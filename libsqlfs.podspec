@@ -24,7 +24,8 @@ Pod::Spec.new do |s|
   s.default_subspec = 'standard'
 
   s.subspec 'common' do |ss|
-    ss.source_files = 'sqlfs_internal.h', 'sqlfs.c', 'sqlfs.h'
+    ss.source_files = 'sqlfs.{h,c}', 'sqlfs_internal.h'
+    ss.xcconfig = { 'OTHER_CFLAGS' => '$(inherited) -ObjC' }
   end
 
   # use a builtin version of sqlite3
@@ -37,6 +38,6 @@ Pod::Spec.new do |s|
   s.subspec 'SQLCipher' do |ss|
     ss.dependency 'SQLCipher/fts'
     ss.dependency 'libsqlfs/common'
-    ss.xcconfig = { 'OTHER_CFLAGS' => '$(inherited) -DHAVE_LIBSQLCIPHER -DSQLITE_HAS_CODEC' }
+    ss.xcconfig = { 'OTHER_CFLAGS' => '$(inherited) -DHAVE_LIBSQLCIPHER -DSQLITE_HAS_CODEC -ObjC' }
   end
 end
