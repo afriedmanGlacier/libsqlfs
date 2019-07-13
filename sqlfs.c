@@ -3273,6 +3273,8 @@ static void * sqlfs_t_init(const char *db_file, const char *password)
             show_msg(stderr, "Opening the database with provided key/password failed!\n");
             return 0;
         }
+        // TODO: Replace hardcoding of SQLCipher compatibility version
+        sqlfs_set_cipher_compatibility(sql_fs, 3);
         sqlite3_exec(sql_fs->db, "PRAGMA cipher_page_size = 8192;", NULL, NULL, NULL);
     }
     else
@@ -3404,6 +3406,23 @@ int sqlfs_open_key(const char *db_file, const uint8_t *key, size_t keylen, sqlfs
 
     if (*psqlfs == 0)
         return 0;
+    return 1;
+}
+
+int sqlfs_set_cipher_compatibility(sqlfs_t *db, const uint32_t cipher_compatibility) {
+    if (!db) { return 1; }
+    char *errorMsg;
+    
+    char buf[256];
+    snprintf(buf, 256, "PRAGMA cipher_compatibility = %"PRIu32";", cipher_compatibility);
+    
+    if (sqlite3_exec(get_sqlfs(db)->db, buf, NULL, NULL, &errorMsg) != SQLITE_OK)
+    {
+        show_msg(stderr,
+                 "failed to set database cipher_compatibility: %s",
+                 errorMsg);
+        return 0;
+    }
     return 1;
 }
 
