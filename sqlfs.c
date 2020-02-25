@@ -87,7 +87,7 @@ struct sqlfs_t
     else \
         r = ~SQLITE_OK; \
     if (r != SQLITE_OK) \
-        r = sqlite3_prepare((a), (b), (c), (d), (e)); \
+        r = sqlite3_prepare_v2((a), (b), (c), (d), (e)); \
     if (r == SQLITE_OK) \
         get_sqlfs(sqlfs)->stmts[INDEX] = stmt; \
     else \
@@ -3424,6 +3424,11 @@ int sqlfs_set_cipher_compatibility(sqlfs_t *db, const uint32_t cipher_compatibil
         return 0;
     }
     return 1;
+}
+
+int sqlfs_vacuum(sqlfs_t *sqlfs)
+{
+    return sqlite3_exec(get_sqlfs(sqlfs)->db, "VACUUM;", NULL, NULL, NULL);
 }
 
 int sqlfs_rekey(const char *db_file_name, const uint8_t *old_key, size_t old_key_len,
