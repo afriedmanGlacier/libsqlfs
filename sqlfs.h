@@ -132,6 +132,9 @@ extern "C" {
      * For more information see https://www.zetetic.net/sqlcipher/sqlcipher-api/#cipher_compatibility
      **/
     int sqlfs_set_cipher_compatibility(sqlfs_t *db, const uint32_t cipher_compatibility);
+
+    int sqlfs_vacuum(sqlfs_t *sqlfs);
+
 #endif
 #ifdef HAVE_LIBFUSE
     int sqlfs_fuse_main(int argc, char **argv);
