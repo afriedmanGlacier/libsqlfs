@@ -116,7 +116,7 @@ extern "C" {
      * http://sqlcipher.net/sqlcipher-api/#key  */
 
     /* This is the password format, it needs a UTF-8 string */
-    int sqlfs_init_password(const char *db_file, const char *password);
+    int sqlfs_init_password(const char *db_file, const char *password); 
     int sqlfs_open_password(const char *db_file, const char *password, sqlfs_t **sqlfs);
     int sqlfs_change_password(const char *db_file_name, const char *old_password, const char *new_password);
     /* This is the raw key format, it needs 32 bytes of raw key data */
@@ -124,6 +124,12 @@ extern "C" {
     int sqlfs_open_key(const char *db_file, const uint8_t *key, size_t keylen, sqlfs_t **psqlfs);
     int sqlfs_rekey(const char *db_file_name, const uint8_t *old_key, size_t old_key_len,
                     const void *new_key, size_t new_key_len);
+
+    //see https://github.com/sqlcipher/sqlcipher/issues/255 (to support unencrypted header when used in shared space)
+    int sqlfs_migrate_to_unencrypted_header(const char *db_file, const char *password, const char *salt, sqlfs_t **sqlfs);
+    int sqlfs_open_password_unencrypted_header(const char *db_file, const char *password, const char *salt, sqlfs_t **sqlfs);
+    int sqlfs_init_password_unencrypted_header(const char *db_file, const char *password, const char *salt);
+
     /**
      * Databases created with SQLCipher 3.0 are not compatible with SQLCipher 4.0.
      * Setting this flag will set "PRAGMA cipher_compatibility = %i" on the current database.

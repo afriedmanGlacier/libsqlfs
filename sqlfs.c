@@ -105,11 +105,13 @@ static char default_db_file[PATH_MAX] = { 0 };
  * thread will open a connection to the database on the fly, so each
  * thread needs the key */
 static char cached_password[MAX_PASSWORD_LENGTH] = { 0 };
+static char cached_salt[MAX_PASSWORD_LENGTH] = { 0 };
 
 static int max_inode = 0;
 
 static void * sqlfs_t_init(const char *db_file, const char *db_key);
 static void sqlfs_t_finalize(void *arg);
+static void * sqlfs_t_init_unencrypted_header(const char *db_file, const char *db_key, const char *db_salt); 
 
 static __inline__ int sql_step(sqlite3_stmt *stmt)
 {
@@ -134,7 +136,8 @@ static __inline__ sqlfs_t *get_sqlfs(sqlfs_t *p)
     if (sqlfs)
         return sqlfs;
 
-    sqlfs = (sqlfs_t*) sqlfs_t_init(default_db_file, cached_password);
+    //sqlfs = (sqlfs_t*) sqlfs_t_init(default_db_file, cached_password);
+    sqlfs = (sqlfs_t*) sqlfs_t_init_unencrypted_header(default_db_file, cached_password, cached_salt);
     return sqlfs;
 }
 
@@ -3341,6 +3344,187 @@ static void * sqlfs_t_init(const char *db_file, const char *password)
     return (void *) sql_fs;
 }
 
+// see https://github.com/sqlcipher/sqlcipher/issues/255
+static void * sqlfs_t_init_unencrypted_header(const char *db_file, const char *password, const char *salt)
+{
+    int i, r;
+    sqlfs_t *sql_fs = calloc(1, sizeof(*sql_fs));
+    assert(sql_fs);
+    for (i = 0; i < (int)(sizeof(sql_fs->stmts) / sizeof(sql_fs->stmts[0])); i++)
+    {
+        sql_fs->stmts[i] = 0;
+    }
+    if (db_file && db_file[0] == 0)
+        show_msg(stderr, "WARNING: blank db file name! Creating temporary database.\n");
+    r = sqlite3_open(db_file, &(sql_fs->db));
+    if (r != SQLITE_OK)
+    {
+        show_msg(stderr, "Cannot open the database file %s\n", db_file);
+        return 0;
+    }
+
+#ifdef HAVE_LIBSQLCIPHER
+    if (password && strlen(password))
+    {
+        r = sqlite3_key(sql_fs->db, password, strlen(password));
+        if (r != SQLITE_OK)
+        {
+            show_msg(stderr, "Opening the database with provided key/password failed!\n");
+            return 0;
+        }
+        // TODO: Replace hardcoding of SQLCipher compatibility version
+        sqlfs_set_cipher_compatibility(sql_fs, 3);
+        sqlite3_exec(sql_fs->db, "PRAGMA cipher_plaintext_header_size = 32;", NULL, NULL, NULL);
+        
+        //sqlite> pragma cipher_salt = "x'5d536b82f423fa040022213980440fbe'";
+        char buf[256];
+        snprintf(buf, 256, "PRAGMA cipher_salt = %s;", salt);
+        sqlite3_exec(sql_fs->db, buf, NULL, NULL, NULL);
+        
+        sqlite3_exec(sql_fs->db, "PRAGMA cipher_page_size = 8192;", NULL, NULL, NULL);
+    }
+    else
+        show_msg(stderr, "WARNING: No password set!\n");
+#endif
+    /* WAL mode improves the performance of write operations (page data must only be
+     * written to disk one time) and improves concurrency by reducing blocking between
+     * readers and writers */
+    sqlite3_exec(sql_fs->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
+
+    /* Without this limit, the WAL file can grow without bounds.  When
+     * extremely heavy loads, the WAL log can rapidly grow larger than
+     * the database itself.  So set a limit here to prevent the disk
+     * from filling with the WAL. */
+    char buf[256];
+    struct statvfs vfs;
+    statvfs(db_file, &vfs);
+    uint64_t limit = 10*1024*1024; // set min limit to 10MB
+    // set dynamic limit to 10% of available space on partition
+    uint64_t availableBytes = (uint64_t)vfs.f_bavail * vfs.f_bsize * 0.1;
+    if (availableBytes > limit)
+        limit = availableBytes;
+    snprintf(buf, 256, "PRAGMA journal_size_limit = %"PRIu64";", limit);
+    sqlite3_exec(sql_fs->db, buf, NULL, NULL, NULL);
+
+    /* WAL mode only performs fsync on checkpoint operation, which reduces overhead
+     * It should make it possible to run with synchronous set to NORMAL with less
+     * of a performance impact.
+    */
+    sqlite3_exec(sql_fs->db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
+
+    /* It is vitally important that write operations not fail to execute due
+     * to busy timeouts. Even using WAL, its still possible for a command to be
+     * blocked due to attempted concurrent write operations. If this happens
+     * without a busy handler, the write will fail and lead to corruption.
+     *
+     * Libsqlfs had attempted to do its own rudimentary busy handling via delay(),
+     * however, its implementation seems to pre-date the availablity of busy
+     * handlers in SQLite. Also, it is only used for some operations, and does not
+     * protect many operations from failure.
+     *
+     * Thus, it is preferable to register SQLite's default busy handler with a
+     * relatively high timeout to globally protect all operations. This is completely
+     * transparent to the caller, and ensure that while a write operation might be
+     * delayed for a period of time, it is unlikely that it will fail completely.
+     *
+     * An initial timeout for 10 seconds is set here, but could be increased to reduce
+     * the chances of failure under high load.
+     */
+    sqlite3_busy_timeout(sql_fs->db, 10000);
+
+    sql_fs->default_mode = 0700; /* allows the creation of children under / , default user at initialization is 0 (root)*/
+
+    create_db_table(sql_fs);
+
+    if (max_inode == 0)
+        max_inode = get_current_max_inode(sql_fs);
+
+    r = ensure_existence(sql_fs, "/", TYPE_DIR);
+    if (!r)
+        return 0;
+    pthread_setspecific(pthread_key, sql_fs);
+    instance_count++;
+    return (void *) sql_fs;
+}
+
+// see https://github.com/sqlcipher/sqlcipher/issues/255
+static void * sqlfs_t_init_migrate_unencrypted_header(const char *db_file, const char *password, const char *salt)
+{
+    int i, r;
+    sqlfs_t *sql_fs = calloc(1, sizeof(*sql_fs));
+    assert(sql_fs);
+    for (i = 0; i < (int)(sizeof(sql_fs->stmts) / sizeof(sql_fs->stmts[0])); i++)
+    {
+        sql_fs->stmts[i] = 0;
+    }
+    if (db_file && db_file[0] == 0)
+        show_msg(stderr, "WARNING: blank db file name! Creating temporary database.\n");
+    r = sqlite3_open(db_file, &(sql_fs->db));
+    if (r != SQLITE_OK)
+    {
+        show_msg(stderr, "Cannot open the database file %s\n", db_file);
+        return 0;
+    }
+
+#ifdef HAVE_LIBSQLCIPHER
+    if (password && strlen(password))
+    {
+        r = sqlite3_key(sql_fs->db, password, strlen(password));
+        if (r != SQLITE_OK)
+        {
+            show_msg(stderr, "Opening the database with provided key/password failed!\n");
+            return 0;
+        }
+        // TODO: Replace hardcoding of SQLCipher compatibility version
+        sqlfs_set_cipher_compatibility(sql_fs, 3);
+        
+        sqlite3_exec(sql_fs->db, "PRAGMA cipher_page_size = 8192;", NULL, NULL, NULL);
+    }
+    else
+        show_msg(stderr, "WARNING: No password set!\n");
+#endif
+    /* WAL mode improves the performance of write operations (page data must only be
+     * written to disk one time) and improves concurrency by reducing blocking between
+     * readers and writers */
+    sqlite3_exec(sql_fs->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
+
+    /* Without this limit, the WAL file can grow without bounds.  When
+     * extremely heavy loads, the WAL log can rapidly grow larger than
+     * the database itself.  So set a limit here to prevent the disk
+     * from filling with the WAL. */
+    char buf[256];
+    struct statvfs vfs;
+    statvfs(db_file, &vfs);
+    uint64_t limit = 10*1024*1024; // set min limit to 10MB
+    // set dynamic limit to 10% of available space on partition
+    uint64_t availableBytes = (uint64_t)vfs.f_bavail * vfs.f_bsize * 0.1;
+    if (availableBytes > limit)
+        limit = availableBytes;
+    snprintf(buf, 256, "PRAGMA journal_size_limit = %"PRIu64";", limit);
+    sqlite3_exec(sql_fs->db, buf, NULL, NULL, NULL);
+
+    /* WAL mode only performs fsync on checkpoint operation, which reduces overhead
+     * It should make it possible to run with synchronous set to NORMAL with less
+     * of a performance impact.
+    */
+    int status; //just used for debugging
+    status = sqlite3_exec(sql_fs->db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
+    
+    status = sqlite3_exec(sql_fs->db, "PRAGMA cipher_plaintext_header_size = 32;", NULL, NULL, NULL);
+    char sbuf[256];
+    snprintf(sbuf, 256, "PRAGMA cipher_salt = %s;", salt);
+    status = sqlite3_exec(sql_fs->db, sbuf, NULL, NULL, NULL);
+
+    // Modify the first page, so that SQLCipher will overwrite, respecting our new cipher_plaintext_header_size
+    status = sqlite3_exec(sql_fs->db, "CREATE TABLE plainhead(a integer);", NULL, NULL, NULL);
+    status = sqlite3_exec(sql_fs->db, "INSERT INTO plainhead(a) VALUES (1);", NULL, NULL, NULL);
+    
+    int log, ckpt;
+    status = sqlite3_wal_checkpoint_v2(sql_fs->db, NULL, SQLITE_CHECKPOINT_FULL, &log, &ckpt);
+    
+    return (void *) sql_fs;
+}
+
 static void sqlfs_t_finalize(void *arg)
 {
     sqlfs_t *sql_fs = (sqlfs_t *) arg;
@@ -3462,6 +3646,26 @@ int sqlfs_open_password(const char *db_file, const char *password, sqlfs_t **psq
     if (*psqlfs == 0)
         return 0;
     return 1;
+}
+
+int sqlfs_open_password_unencrypted_header(const char *db_file, const char *password, const char *salt, sqlfs_t **psqlfs)
+{
+    sqlfs_init_password_unencrypted_header(db_file, password, salt);
+    *psqlfs = sqlfs_t_init_unencrypted_header(db_file, password, salt);
+
+    if (*psqlfs == 0)
+        return 0;
+    return 1;
+}
+
+int sqlfs_migrate_to_unencrypted_header(const char *db_file, const char *password, const char *salt, sqlfs_t **psqlfs)
+{
+    sqlfs_init_password_unencrypted_header(db_file, password, salt);
+    *psqlfs = sqlfs_t_init_migrate_unencrypted_header(db_file, password, salt);
+
+    if (*psqlfs == 0)
+        return SQLITE_ERROR;
+    return SQLITE_OK;
 }
 
 int sqlfs_change_password(const char *db_file_name, const char *old_password, const char *new_password)
@@ -3707,6 +3911,18 @@ int sqlfs_init_password(const char *db_file, const char *password)
     strncpy(cached_password, password, MAX_PASSWORD_LENGTH);
     return sqlfs_init(db_file);
 }
+
+int sqlfs_init_password_unencrypted_header(const char *db_file, const char *password, const char *salt)
+{
+    if (strlen(password) > MAX_PASSWORD_LENGTH) {
+        show_msg(stderr, "Password longer than MAX_PASSWORD_LENGTH (%li > %i)\n",
+                 strlen(password), MAX_PASSWORD_LENGTH);
+        return 1;
+    }
+    strncpy(cached_password, password, MAX_PASSWORD_LENGTH);
+    strncpy(cached_salt, salt, MAX_PASSWORD_LENGTH);
+    return sqlfs_init(db_file);
+}
 #endif
 
 int sqlfs_instance_count()
@@ -3721,6 +3937,7 @@ int sqlfs_fuse_main(int argc, char **argv)
     int ret = fuse_main(argc, argv, &sqlfs_op);
     /* zero out password in memory */
     memset(cached_password, 0, MAX_PASSWORD_LENGTH);
+    memset(cached_salt, 0, MAX_PASSWORD_LENGTH); 
     return ret;
 }
 
